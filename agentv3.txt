@@ -1,0 +1,260 @@
+import os
+import yaml
+import json
+import asyncio
+from fastmcp import Client
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from typing import AsyncGenerator, Dict, Any
+
+# Load config
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+# Azure OpenAI setup
+api_key = config["AZURE_OPENAI_API_KEY"]
+api_base = config["AZURE_OPENAI_ENDPOINT"]
+chat_deployment = config["AZURE_OPENAI_CHAT_DEPLOYMENT"]
+
+# Initialize LLM
+llm = AzureChatOpenAI(
+    openai_api_key=api_key,
+    azure_endpoint=api_base,
+    deployment_name=chat_deployment,
+    model="gpt-4o",
+    openai_api_version="2024-12-01-preview",
+    temperature=0,
+    top_p=0.1
+)
+
+# Convert MCP tools to LLM function schemas
+def convert_tools_to_llm_functions(mcp_tools):
+    llm_functions = []
+    for tool in mcp_tools:
+        if hasattr(tool, "dict"):
+            tool = tool.dict()
+        llm_functions.append({
+            "name": tool.get("name"),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("inputSchema", {}),
+        })
+    return llm_functions
+
+
+class StatefulMCPAgent:
+    def __init__(self, mcp_url):
+        self.mcp_url = mcp_url
+        self.llm_functions = []
+        self.thinking_steps = []
+        self.max_cycles = 5  # Keep last 5 user query cycles
+        self.history_cycles = []  # Each cycle: {"user": str, "tools": [...], "final": str}
+
+    async def initialize_tools(self):
+        async with Client(self.mcp_url) as mcp_client:
+            tools = await mcp_client.list_tools()
+            self.llm_functions = convert_tools_to_llm_functions(tools)
+
+    def _get_streaming_system_prompt(self) -> str:
+        # Clean, readable system prompt
+        return (
+           """You are a Tableau data assistant with access to MCP tools. You are assisting the user in analyzing data across multiple datasources. Your primary goal is to **understand user intent accurately**, **track notable entities**, and **translate user-friendly terms into datasource-compatible values**, while maintaining context across multiple turns.
+
+When you receive a query, you will work in three phases:
+
+1. **Understanding & Planning**
+   - Extract the key entities from the user query (e.g., branch names, regions, products, metrics, dates).
+   - Map any user-friendly values to the corresponding datasource-compatible codes or identifiers if needed (e.g., branch names → branch codes).
+   - Normalize dates to ISO format (YYYY-MM-DD or date ranges) and ensure they are compatible with the datasource.
+   - Identify filters, metrics, aggregations, and sorting instructions implied by the user.
+   - Reference any previously established context anchors (datasource, filters, dates, metrics, limits) unless explicitly overridden by the user.
+
+2. **Tool Execution**
+   - Determine which MCP tools must be called to satisfy the user’s request.
+   - Use the correct **datasource ID**, **field names**, and **parameters**.
+   - Chain tool calls as needed, without asking the user for confirmation.
+   - Record **successful tool outputs** and update context anchors:
+     - Filters applied
+     - Datasource used
+     - Metrics retrieved
+     - Dates applied
+     - Any corrections (e.g., fuzzy matching resolved values)
+   - Handle errors using fuzzy matching and retries. If a value is invalid, automatically correct using closest suggestion from the datasource and note this in your reasoning.
+
+3. **Final Answer**
+   - Analyze tool results.
+   - Apply client-side limits if needed (Top N rows, etc.).
+   - Format and present the answer clearly to the user.
+   - Make explicit any assumptions, corrections, or normalizations applied.
+
+---
+
+**Context Anchor Guidelines:**
+- Maintain persistent memory of:
+  - Last used datasource
+  - Filters (e.g., branch codes, regions)
+  - Metrics and aggregations
+  - Dates
+  - Limits (e.g., Top N)
+  - Fuzzy-matched corrections
+- Always reuse context anchors unless the user explicitly overrides them.
+- If user provides a partial query or a single entity (e.g., "Karachi"), merge it into existing anchors rather than replacing all context.
+
+---
+
+**Tool Usage Guidelines:**
+- Filter syntax: `"field:operator:value"` (operators: eq, in, gt, gte, lt, lte)
+- Always use exact field names from datasource metadata
+- Chain tool calls as needed without asking for confirmation
+- Query structure for MCP tools must follow the JSON format:
+
+```json
+{
+  "datasourceLuid": "string",
+  "query": {
+    "fields": [
+      {
+        "fieldCaption": "FieldName",
+        "fieldAlias": "AliasName",
+        "function": "SUM|AVG|COUNT|etc",
+        "sortDirection": "ASC|DESC",
+        "sortPriority": 1
+      }
+    ],
+    "filters": [
+      {
+        "field": { "fieldCaption": "FieldName" },
+        "filterType": "SET",
+        "values": ["value1"],
+        "exclude": false
+      }
+    ]
+  }
+}
+Error Handling & Fuzzy Matching:
+
+If a value is not found, select the closest match from suggestions.
+
+Automatically retry the query with the corrected value.
+
+Record any corrections in context anchors.
+
+Translate errors into plain English for the user.
+
+Date Handling Rules:
+
+Always normalize user-supplied dates to datasource-compatible format.
+
+Interpret phrases like "Jan 2025", "last month", or "Q1 2025" accurately.
+
+Store normalized date ranges in context anchors for reuse.
+
+Response Requirements:
+
+Explicitly explain your approach before executing tool calls.
+
+Mention what entities are being applied from context anchors.
+
+Clarify any assumptions or corrections made.
+
+Only return final results after all necessary tool calls and reasoning.
+
+"""
+        )
+
+    def _store_cycle(self, user_prompt: str, thinking_steps: list, final_response: str):
+        for t in thinking_steps:
+            if t["status"] == "complete":
+                if t['title'] == 'Using Tool: query-datasource':
+                    tool_call_parameters = t['content']
+
+        self.history_cycles.append({
+            "user": user_prompt,
+            "tool_call_parameters": tool_call_parameters if 'tool_call_parameters' in locals() else None,
+            "final": final_response,
+
+        })
+
+        self.history_cycles = self.history_cycles[-self.max_cycles:]
+
+    def _build_working_conversation(self, system_prompt: str) -> list:
+        conversation = [SystemMessage(content=system_prompt)]
+        for cycle in self.history_cycles:
+            conversation.append(HumanMessage(content=cycle["user"]))
+            # for step in cycle["tools"]:
+            #     conversation.append(AIMessage(content=f"{step['title']}:\n{step['content']}"))
+            conversation.append(AIMessage(content=cycle["final"]))
+        return conversation
+
+    async def run_stream(self, user_prompt: str, conversation_id: str = None, is_regenerate: bool = False) -> AsyncGenerator[Dict[str, Any], None]:
+        if is_regenerate and self.history_cycles:
+            self.history_cycles.pop()  # Remove last cycle
+
+        self.thinking_steps = []
+        system_prompt = self._get_streaming_system_prompt()
+        working_conversation = self._build_working_conversation(system_prompt)
+        print(working_conversation)
+        working_conversation.append(HumanMessage(content=f"{user_prompt}\nPlease start by briefly outlining your approach."))
+
+        async with Client(self.mcp_url) as mcp_client:
+            # PHASE 1: Planning & Reasoning
+            planning_step = {"title": "Planning & Reasoning", "content": "", "status": "in-progress"}
+            yield {"type": "thinking_step", "step": planning_step}
+
+            planning_content = ""
+            async for chunk in llm.astream(working_conversation):
+                chunk_text = getattr(chunk, "content", "")
+                if chunk_text:
+                    planning_content += chunk_text
+                    planning_step["content"] = planning_content
+                    yield {"type": "thinking_step_update", "step": planning_step}
+
+            planning_step["status"] = "complete"
+            self.thinking_steps.append(planning_step)
+            yield {"type": "thinking_step_complete", "step": planning_step}
+            working_conversation.append(SystemMessage(content=f"Your approach: {planning_content}"))
+            working_conversation.append(HumanMessage(content="Now proceed with executing the necessary tools."))
+
+            # PHASE 2: Tool Execution
+            max_iterations = 10
+            iteration = 0
+            while iteration < max_iterations:
+                iteration += 1
+                response = await llm.ainvoke(working_conversation, functions=self.llm_functions)
+                fn_call = getattr(response, "additional_kwargs", {}).get("function_call")
+                if not fn_call:
+                    break
+
+                tool_name = fn_call["name"]
+                tool_args = json.loads(fn_call.get("arguments", "{}"))
+                tool_step = {"title": f"Using Tool: {tool_name}", "content": f"Calling `{tool_name}` with params:\n{json.dumps(tool_args, indent=2)}", "status": "in-progress"}
+                yield {"type": "thinking_step", "step": tool_step}
+
+                try:
+                    tool_result = await mcp_client.call_tool(tool_name, tool_args)
+                    tool_content_text = "\n".join([c.text for c in tool_result.content if hasattr(c, "text")]) if tool_result.content else ""
+                    tool_step["status"] = "complete"
+                    tool_step["content"] += f"\nResult received ({len(tool_content_text)} chars)"
+                    self.thinking_steps.append(tool_step)
+                    yield {"type": "thinking_step_complete", "step": tool_step}
+                    working_conversation.append(SystemMessage(content=f"Tool {tool_name} returned:\n{tool_content_text}"))
+                except Exception as tool_error:
+                    error_msg = str(tool_error)
+                    tool_step["status"] = "error"
+                    tool_step["content"] += f"\nError: {error_msg}"
+                    self.thinking_steps.append(tool_step)
+                    yield {"type": "thinking_step_complete", "step": tool_step}
+                    working_conversation.append(SystemMessage(content=f"Tool {tool_name} failed with error: {error_msg}"))
+                    continue
+
+            # PHASE 3: Final Response
+            working_conversation.append(HumanMessage(content="Now analyze results and provide final answer."))
+            final_content = ""
+            async for chunk in llm.astream(working_conversation):
+                chunk_text = getattr(chunk, "content", "")
+                if chunk_text:
+                    final_content += chunk_text
+                    yield {"type": "content", "content": chunk_text}
+
+            self._store_cycle(user_prompt, self.thinking_steps, final_content)
+            print("Cycle completed with:", self.history_cycles)
+            yield {"type": "done"}
